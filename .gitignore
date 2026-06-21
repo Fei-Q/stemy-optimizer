@@ -1,0 +1,39 @@
+# Python cache/build artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+.env
+
+# Local/system files
+.DS_Store
+.idea/
+.vscode/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# SteMy generated outputs
+results/
+*.log
+
+# Large/local data exports
+*.csv
+*.tsv
+*.xlsx
+*.xls
+*.h5
+*.hdf5
+*.parquet
+
+# Keep example data if explicitly placed there
+!examples/**/*.csv
+!examples/**/*.tsv

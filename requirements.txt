@@ -1,0 +1,6 @@
+# Core optimizer stack
+ax-platform>=1.1.0
+numpy>=1.24
+
+# Optional developer tooling
+# pytest>=8.0
