@@ -6,7 +6,12 @@ SteMy's iPSC-cardiomyocyte differentiation simulator and future wet-lab backend.
 It separates proposed experimental configurations from actual executed runs:
 
     config TSV: proposed setups and edit history
-    log TSV:    actual runs, outcomes, and Ax sync state
+    log TSV:    actual runs, outcomes, planned-vs-actual values, and Ax sync state
+
+For noisy/human-execution simulation, Ax proposes planned dynamic values, the
+simulator generates actual executed values for both dynamic variables and
+static/control variables, and sync-results updates Ax using actual executed
+dynamic values only.
 
 Core commands:
     create-study   Create a persistent Ax study.
@@ -51,7 +56,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 
-from simulator import PARAM_SPECS, simulate
+try:
+    from simulator_noisy import PARAM_SPECS, simulate
+except ImportError:
+    from simulator import PARAM_SPECS, simulate
 
 try:
     from ax.api.client import Client
@@ -60,7 +68,7 @@ except ImportError as exc:
     raise ImportError("Install Ax with: pip install -U ax-platform") from exc
 
 
-VERSION = "1.1.0"
+VERSION = "1.2.0-noisy"
 OBJECTIVE_NAME = "ctnt_pct"
 SCRIPT_DIR = Path(__file__).resolve().parent
 RESULTS_DIR = SCRIPT_DIR.parent / "results"
@@ -83,18 +91,36 @@ LOG_BASE_COLUMNS = [
     "batch_id",
     "run_id",
     "config_id",
+    # Ax trial originally created for the planned recommendation.
     "trial_index",
+    # Ax trial attached later from actual executed x values during sync.
+    "synced_trial_index",
     "run_status",
     "ctnt_pct",
     "synced",
     "started_at",
     "finished_at",
+    "variability_strength",
     "notes",
 ]
 
 DEFAULT_OPTIMIZER_PARAMS = [
     name for name, spec in PARAM_SPECS.items() if bool(spec.get("optimizable", False))
 ]
+
+
+def dynamic_param_names() -> list[str]:
+    """All simulator parameters classified as dynamic/optimizable in PARAM_SPECS."""
+    return [name for name, spec in PARAM_SPECS.items() if bool(spec.get("optimizable", False))]
+
+
+def control_param_names() -> list[str]:
+    """All simulator parameters classified as static/control in PARAM_SPECS."""
+    return [name for name, spec in PARAM_SPECS.items() if not bool(spec.get("optimizable", False))]
+
+
+def simulator_default_value(name: str) -> float:
+    return float(PARAM_SPECS[name]["default"])
 
 
 # -----------------------------------------------------------------------------
@@ -235,7 +261,21 @@ def config_fieldnames(param_names: list[str]) -> list[str]:
 
 
 def log_fieldnames(param_names: list[str]) -> list[str]:
-    return LOG_BASE_COLUMNS + [f"{name}_actual" for name in param_names]
+    """Return run-log columns for planned/actual/delta tracking.
+
+    The config table remains the optimizer proposal table. The log table is the
+    as-treated execution table. It tracks all simulator dynamic variables as
+    x_planned/x_actual/delta_x and all static/control variables as
+    z_target/z_actual/delta_z. Only the study optimizer parameters are synced
+    back into Ax, and they are synced using *_actual values.
+    """
+    del param_names  # retained for API compatibility with existing callers
+    fields = list(LOG_BASE_COLUMNS)
+    for name in dynamic_param_names():
+        fields.extend([f"{name}_planned", f"{name}_actual", f"{name}_delta"])
+    for name in control_param_names():
+        fields.extend([f"{name}_target", f"{name}_actual", f"{name}_delta"])
+    return fields
 
 
 def save_config_rows(study_id: str, rows: list[dict[str, Any]], param_names: list[str]) -> None:
@@ -736,15 +776,31 @@ def run_configs(
             "run_id": run_id,
             "config_id": cfg["config_id"],
             "trial_index": cfg["trial_index"],
+            "synced_trial_index": "",
             "run_status": "running",
             "ctnt_pct": "",
             "synced": "false",
             "started_at": started_at,
             "finished_at": "",
+            "variability_strength": "",
             "notes": "",
         }
-        for name in param_names:
-            run_row[f"{name}_actual"] = cfg[name]
+
+        # Planned dynamic values: Ax-controlled parameters come from the config;
+        # other simulator dynamic variables use defaults and are still logged.
+        for name in dynamic_param_names():
+            planned_value = float(cfg[name]) if name in param_names else simulator_default_value(name)
+            run_row[f"{name}_planned"] = planned_value
+            run_row[f"{name}_actual"] = ""
+            run_row[f"{name}_delta"] = ""
+
+        # Static/control targets are not optimized by Ax, but are logged so a
+        # separate QC/reproducibility module can later interpret z_target->z_actual.
+        for name in control_param_names():
+            run_row[f"{name}_target"] = simulator_default_value(name)
+            run_row[f"{name}_actual"] = ""
+            run_row[f"{name}_delta"] = ""
+
         log_rows.append(run_row)
         created_run_ids.append(run_id)
 
@@ -759,11 +815,32 @@ def run_configs(
     return created_run_ids
 
 
-def params_from_log_row(row: dict[str, str], param_names: list[str]) -> dict[str, float]:
-    return {name: float(row[f"{name}_actual"]) for name in param_names}
+def planned_params_from_log_row(row: dict[str, str]) -> dict[str, float]:
+    """Read planned dynamic values and control targets from one run-log row."""
+    params: dict[str, float] = {}
+    for name in dynamic_param_names():
+        params[name] = safe_float(row.get(f"{name}_planned"))
+    for name in control_param_names():
+        params[name] = safe_float(row.get(f"{name}_target"))
+    return params
 
 
-def simulate_completed_runs(*, study_id: str, batch_id: str, seed: int) -> None:
+def actual_optimizer_params_from_log_row(row: dict[str, str], param_names: list[str]) -> dict[str, float]:
+    """Read actual executed values for the Ax search-space parameters."""
+    actual: dict[str, float] = {}
+    missing: list[str] = []
+    for name in param_names:
+        value = safe_float(row.get(f"{name}_actual"))
+        if math.isnan(value):
+            missing.append(name)
+        else:
+            actual[name] = value
+    if missing:
+        raise ValueError(f"Missing actual values for optimizer parameter(s): {missing}")
+    return actual
+
+
+def simulate_completed_runs(*, study_id: str, batch_id: str, seed: int, variability_strength: float = 0.05) -> None:
     """Evaluate running rows in the simulator and write outcomes to the log."""
     metadata = load_metadata(study_id)
     param_names = list(metadata["param_names"])
@@ -777,11 +854,48 @@ def simulate_completed_runs(*, study_id: str, batch_id: str, seed: int) -> None:
         if row.get("batch_id") != batch_id or row.get("run_status") != "running":
             continue
         trial_index = int(row["trial_index"])
-        params = params_from_log_row(row, param_names)
-        out = simulate(params=params, seed=seed + trial_index, validate=True)
+        planned_params = planned_params_from_log_row(row)
+        out = simulate(
+            params=planned_params,
+            seed=seed + trial_index,
+            validate=True,
+            variability_strength=variability_strength,
+        )
+
         row["ctnt_pct"] = out["ctnt_pct"]
         row["run_status"] = "completed"
         row["finished_at"] = finished_at
+        row["variability_strength"] = float(variability_strength)
+
+        # Persist planned -> actual traces produced by the noisy simulator.
+        # Prefer explicit x/z groups if available, but also support simulator
+        # versions that only return planned_params/actual_params/deviations.
+        planned_all = out.get("planned_params", planned_params)
+        actual_all = out.get("actual_params", {})
+        deviations_all = out.get("parameter_deviations", {})
+
+        x_planned = out.get("x_planned") or {name: planned_all.get(name) for name in dynamic_param_names()}
+        x_actual = out.get("x_actual") or {name: actual_all.get(name) for name in dynamic_param_names()}
+        delta_x = out.get("delta_x") or {name: deviations_all.get(name) for name in dynamic_param_names()}
+
+        z_target = out.get("z_target") or {name: planned_all.get(name) for name in control_param_names()}
+        z_actual = out.get("z_actual") or {name: actual_all.get(name) for name in control_param_names()}
+        delta_z = out.get("delta_z") or {name: deviations_all.get(name) for name in control_param_names()}
+
+        for name, value in x_planned.items():
+            row[f"{name}_planned"] = "" if value is None else value
+        for name, value in x_actual.items():
+            row[f"{name}_actual"] = "" if value is None else value
+        for name, value in delta_x.items():
+            row[f"{name}_delta"] = "" if value is None else value
+
+        for name, value in z_target.items():
+            row[f"{name}_target"] = "" if value is None else value
+        for name, value in z_actual.items():
+            row[f"{name}_actual"] = "" if value is None else value
+        for name, value in delta_z.items():
+            row[f"{name}_delta"] = "" if value is None else value
+
         simulated += 1
 
         for cfg in config_rows:
@@ -821,8 +935,21 @@ def sync_results(*, study_id: str, results_file: str | None = None) -> int:
         ctnt = safe_float(row.get("ctnt_pct"))
         if math.isnan(ctnt):
             continue
-        trial_index = int(row["trial_index"])
-        complete_trial(client, trial_index, ctnt)
+        # Actual-as-treated sync: do not complete the original planned Ax trial.
+        # Attach a new trial using actual executed optimizer-parameter values,
+        # then complete that actual trial with the observed cTnT outcome.
+        try:
+            actual_params = actual_optimizer_params_from_log_row(row, param_names)
+        except ValueError as exc:
+            print(f"Skipping sync for {row.get('batch_id')}/{row.get('run_id')}: {exc}")
+            continue
+
+        planned_trial_index = int(row["trial_index"])
+        mark_trial_failed_if_possible(client, planned_trial_index)
+        actual_trial_index = attach_trial(client, actual_params)
+        complete_trial(client, actual_trial_index, ctnt)
+
+        row["synced_trial_index"] = actual_trial_index
         row["synced"] = "true"
         synced_count += 1
 
@@ -927,9 +1054,12 @@ def compute_summary(study_id: str) -> dict[str, Any]:
             "batch_id": best_row.get("batch_id"),
             "run_id": best_row.get("run_id"),
             "config_id": best_row.get("config_id"),
-            "trial_index": best_row.get("trial_index"),
+            "planned_trial_index": best_row.get("trial_index"),
+            "synced_trial_index": best_row.get("synced_trial_index"),
             "ctnt_pct": safe_float(best_row.get("ctnt_pct")),
-            "params": {f"{name}_actual": safe_float(best_row.get(f"{name}_actual")) for name in param_names},
+            "x_planned": {name: safe_float(best_row.get(f"{name}_planned")) for name in param_names},
+            "x_actual": {name: safe_float(best_row.get(f"{name}_actual")) for name in param_names},
+            "delta_x": {name: safe_float(best_row.get(f"{name}_delta")) for name in param_names},
         }
 
     return summary
@@ -967,8 +1097,9 @@ def print_summary(study_id: str, *, as_json: bool = False) -> None:
         print(f"  batch_id:    {best['batch_id']}")
         print(f"  run_id:      {best['run_id']}")
         print(f"  config_id:   {best['config_id']}")
-        print(f"  trial_index: {best['trial_index']}")
-        print(f"  ctnt_pct:    {best['ctnt_pct']:.2f}")
+        print(f"  planned_trial_index: {best.get('planned_trial_index')}")
+        print(f"  synced_trial_index:  {best.get('synced_trial_index')}")
+        print(f"  ctnt_pct:            {best['ctnt_pct']:.2f}")
     else:
         print("  none yet")
 
@@ -998,6 +1129,7 @@ def simulate_loop(
     batch_size: int,
     rec_mode: str,
     seed: int,
+    variability_strength: float = 0.05,
 ) -> None:
     if batch_size < 1:
         raise ValueError("--batch-size must be >= 1")
@@ -1017,7 +1149,7 @@ def simulate_loop(
         n = min(batch_size, remaining)
         batch_id = recommend_configs(study_id=study_id, n_trials=n, policy="balanced", interactive=False)
         run_configs(study_id=study_id, batch_id=batch_id, config_ids=None, plate_id="P1", run_ids=None)
-        simulate_completed_runs(study_id=study_id, batch_id=batch_id, seed=seed)
+        simulate_completed_runs(study_id=study_id, batch_id=batch_id, seed=seed, variability_strength=variability_strength)
         sync_results(study_id=study_id)
         remaining -= n
 
@@ -1066,6 +1198,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_sim.add_argument("--batch-size", type=int, default=6)
     p_sim.add_argument("--rec-mode", default="auto-accept")
     p_sim.add_argument("--seed", type=int, default=123)
+    p_sim.add_argument("--variability-strength", type=float, default=0.05, help="Independent execution-noise scale as a fraction of each parameter tolerance/range.")
 
     p_sync = sub.add_parser("sync-results", help="Sync completed results into Ax.")
     p_sync.add_argument("--study-id", required=True)
@@ -1120,6 +1253,7 @@ def main() -> None:
             batch_size=args.batch_size,
             rec_mode=args.rec_mode,
             seed=args.seed,
+            variability_strength=args.variability_strength,
         )
     elif args.command == "sync-results":
         sync_results(study_id=args.study_id, results_file=args.results_file)
